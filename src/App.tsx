@@ -1,11 +1,13 @@
 import { type FormEvent, useEffect, useState } from 'react'
+import devisLogo from './assets/devis1.png'
 import './App.css'
 
 type QuoteForm = {
   service: string
-  project: string
   cantonId: string
-  name: string
+  firstName: string
+  lastName: string
+  phone: string
   email: string
 }
 
@@ -27,6 +29,16 @@ type SwissGeoAdminResponse = {
   results?: SwissGeoAdminResult[]
 }
 
+type SubmitStatus = 'idle' | 'submitting' | 'saved' | 'missingConfig' | 'error'
+type JsonpResponse = {
+  ok: boolean
+  error?: string
+}
+
+const googleScriptUrl = import.meta.env.VITE_GOOGLE_SCRIPT_URL?.trim() ?? ''
+const geoAdminFindUrl = 'https://api3.geo.admin.ch/rest/services/api/MapServer/find'
+const cantonLayer = 'ch.swisstopo.swissboundaries3d-kanton-flaeche.fill'
+
 const services = [
   'Rénovation',
   'Peinture',
@@ -36,13 +48,6 @@ const services = [
   'Plomberie',
   'Fenêtres',
   'Jardin',
-]
-
-const benefits = [
-  '100% gratuit',
-  'Sans engagement',
-  'Jusqu’à 4 offres',
-  'Prestataires locaux',
 ]
 
 const steps = [
@@ -57,6 +62,29 @@ const steps = [
   {
     title: 'Choisissez sereinement',
     text: 'Comparez les prix, les délais et les prestations avant de décider.',
+  },
+]
+
+const subsidyTopics = [
+  {
+    title: 'Diagnostic énergétique',
+    amount: 'Souvent partiellement pris en charge',
+    text: 'Un CECB Plus ou un conseil énergétique peut aider à prioriser les travaux avant de déposer une demande.',
+  },
+  {
+    title: 'Isolation du bâtiment',
+    amount: 'Aide souvent calculée au m²',
+    text: 'Façade, toiture, murs ou sols peuvent être soutenus lorsque les exigences techniques du canton sont respectées.',
+  },
+  {
+    title: 'Remplacement du chauffage',
+    amount: 'Forfaits possibles de plusieurs milliers de CHF',
+    text: 'Les aides visent surtout le passage du mazout, gaz ou chauffage électrique vers des solutions renouvelables.',
+  },
+  {
+    title: 'Rénovation globale',
+    amount: 'Bonus possibles selon le canton',
+    text: 'Les projets combinant isolation, chauffage et amélioration énergétique peuvent recevoir un soutien plus important.',
   },
 ]
 
@@ -108,65 +136,134 @@ const cantonSearchTerms = ['a', 'e', 'i', 'o', 'u', 'y']
 
 const initialForm: QuoteForm = {
   service: services[0],
-  project: '',
   cantonId: '',
-  name: '',
+  firstName: '',
+  lastName: '',
+  phone: '',
   email: '',
 }
 
+const formatCanton = (canton: Canton) =>
+  `${String(canton.id).padStart(2, '0')} - ${canton.name} (${canton.abbreviation})`
+
+const createCantonSearchUrl = (term: string) => {
+  const url = new URL(geoAdminFindUrl)
+  url.searchParams.set('layer', cantonLayer)
+  url.searchParams.set('searchText', term)
+  url.searchParams.set('searchField', 'name')
+  url.searchParams.set('returnGeometry', 'false')
+  url.searchParams.set('contains', 'true')
+  return url
+}
+
+const mapCantonResponses = (responses: SwissGeoAdminResponse[]) => {
+  const cantonsById = responses
+    .flatMap((response) => response.results ?? [])
+    .reduce<Map<number, Canton>>((current, result) => {
+      const name = result.attributes.name
+      const abbreviation = result.attributes.ak
+
+      if (name && abbreviation) {
+        current.set(result.id, { id: result.id, name, abbreviation })
+      }
+
+      return current
+    }, new Map())
+
+  return [...cantonsById.values()].sort((a, b) => a.id - b.id)
+}
+
+const loadSwissCantons = async (signal: AbortSignal) => {
+  const responses = await Promise.all(
+    cantonSearchTerms.map(async (term) => {
+      const response = await fetch(createCantonSearchUrl(term), { signal })
+
+      if (!response.ok) {
+        throw new Error('Swiss GeoAdmin API unavailable')
+      }
+
+      return (await response.json()) as SwissGeoAdminResponse
+    }),
+  )
+
+  const cantons = mapCantonResponses(responses)
+  return cantons.length >= 26 ? cantons : fallbackCantons
+}
+
+const submitLeadToGoogleSheet = async (form: QuoteForm, canton: Canton | undefined) => {
+  if (!googleScriptUrl) {
+    return 'missingConfig' satisfies SubmitStatus
+  }
+
+  const url = new URL(googleScriptUrl)
+  url.searchParams.set('action', 'submit')
+  url.searchParams.set('submittedAt', new Date().toISOString())
+  url.searchParams.set('service', form.service)
+  url.searchParams.set('cantonNumber', String(canton?.id ?? ''))
+  url.searchParams.set('cantonName', canton?.name ?? '')
+  url.searchParams.set('cantonAbbreviation', canton?.abbreviation ?? '')
+  url.searchParams.set('firstName', form.firstName)
+  url.searchParams.set('lastName', form.lastName)
+  url.searchParams.set('phone', form.phone)
+  url.searchParams.set('email', form.email)
+  url.searchParams.set('source', 'DEVIS SWISS')
+
+  const response = await requestJsonp(url)
+
+  if (!response.ok) {
+    throw new Error(response.error ?? 'Lead save failed')
+  }
+
+  return 'saved' satisfies SubmitStatus
+}
+
+const requestJsonp = (url: URL) =>
+  new Promise<JsonpResponse>((resolve, reject) => {
+    const callbackName = `__devisSwiss${Date.now()}${Math.random()
+      .toString(36)
+      .slice(2)}`
+    const callbacks = window as typeof window & Record<string, (data: JsonpResponse) => void>
+    const script = document.createElement('script')
+
+    const timeout = window.setTimeout(() => {
+      cleanup()
+      reject(new Error('Apps Script timeout'))
+    }, 12000)
+
+    const cleanup = () => {
+      window.clearTimeout(timeout)
+      delete callbacks[callbackName]
+      script.remove()
+    }
+
+    callbacks[callbackName] = (data) => {
+      cleanup()
+      resolve(data)
+    }
+
+    url.searchParams.set('callback', callbackName)
+    script.src = url.toString()
+    script.async = true
+    script.onerror = () => {
+      cleanup()
+      reject(new Error('Apps Script URL invalid or unavailable'))
+    }
+
+    document.body.append(script)
+  })
+
 function App() {
   const [form, setForm] = useState<QuoteForm>(initialForm)
-  const [submitted, setSubmitted] = useState(false)
   const [cantons, setCantons] = useState<Canton[]>(fallbackCantons)
   const [isLoadingCantons, setIsLoadingCantons] = useState(true)
+  const [submitStatus, setSubmitStatus] = useState<SubmitStatus>('idle')
 
   useEffect(() => {
     const controller = new AbortController()
 
-    const loadCantons = async () => {
+    const syncCantons = async () => {
       try {
-        const responses = await Promise.all(
-          cantonSearchTerms.map(async (term) => {
-            const url = new URL(
-              'https://api3.geo.admin.ch/rest/services/api/MapServer/find',
-            )
-            url.searchParams.set(
-              'layer',
-              'ch.swisstopo.swissboundaries3d-kanton-flaeche.fill',
-            )
-            url.searchParams.set('searchText', term)
-            url.searchParams.set('searchField', 'name')
-            url.searchParams.set('returnGeometry', 'false')
-            url.searchParams.set('contains', 'true')
-
-            const response = await fetch(url, { signal: controller.signal })
-
-            if (!response.ok) {
-              throw new Error('Swiss GeoAdmin API unavailable')
-            }
-
-            return (await response.json()) as SwissGeoAdminResponse
-          }),
-        )
-
-        const loadedCantons = responses
-          .flatMap((response) => response.results ?? [])
-          .reduce<Map<number, Canton>>((current, result) => {
-            const name = result.attributes.name
-            const abbreviation = result.attributes.ak
-
-            if (name && abbreviation) {
-              current.set(result.id, { id: result.id, name, abbreviation })
-            }
-
-            return current
-          }, new Map())
-
-        const nextCantons = [...loadedCantons.values()].sort((a, b) => a.id - b.id)
-
-        if (nextCantons.length >= 26) {
-          setCantons(nextCantons)
-        }
+        setCantons(await loadSwissCantons(controller.signal))
       } catch {
         if (!controller.signal.aborted) {
           setCantons(fallbackCantons)
@@ -178,119 +275,99 @@ function App() {
       }
     }
 
-    void loadCantons()
+    void syncCantons()
 
     return () => controller.abort()
   }, [])
 
+  const selectedCanton = cantons.find((canton) => String(canton.id) === form.cantonId)
+  const isSubmitting = submitStatus === 'submitting'
   const canSubmit =
-    form.project.trim().length > 6 &&
     form.cantonId.length > 0 &&
-    form.name.trim().length > 1 &&
-    form.email.includes('@')
+    form.firstName.trim().length > 1 &&
+    form.lastName.trim().length > 1 &&
+    form.phone.trim().length >= 7 &&
+    form.email.includes('@') &&
+    !isSubmitting
 
   const updateForm = (field: keyof QuoteForm, value: string) => {
-    setSubmitted(false)
+    setSubmitStatus('idle')
     setForm((current) => ({ ...current, [field]: value }))
   }
 
-  const submitQuote = (event: FormEvent<HTMLFormElement>) => {
+  const submitQuote = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    if (canSubmit) {
-      setSubmitted(true)
+    if (!canSubmit) {
+      return
     }
+
+    setSubmitStatus('submitting')
+
+    try {
+      setSubmitStatus(await submitLeadToGoogleSheet(form, selectedCanton))
+    } catch {
+      setSubmitStatus('error')
+    }
+  }
+
+  if (submitStatus === 'saved') {
+    return (
+      <main className="done-page">
+        <section className="done-card" role="status">
+          <a className="brand" href="#top" aria-label="DEVIS SWISS accueil">
+            <img className="brand-logo" src={devisLogo} alt="DEVIS SWISS" />
+          </a>
+          <div className="done-mark" aria-hidden="true">
+            ✓
+          </div>
+          <p className="eyebrow">Demande reçue</p>
+          <h1>Votre demande a bien été enregistrée.</h1>
+          <p>
+            Merci. Nous avons reçu vos informations et nous vous contacterons
+            prochainement pour la suite de votre demande.
+          </p>
+          <button
+            className="secondary-link"
+            type="button"
+            onClick={() => {
+              setForm(initialForm)
+              setSubmitStatus('idle')
+            }}
+          >
+            Faire une autre demande
+          </button>
+        </section>
+      </main>
+    )
   }
 
   return (
     <main>
       <header className="topbar">
-        <a className="brand" href="#top" aria-label="DEVIS SUITE accueil">
-          <span>DEVIS</span>
-          <strong>SUITE</strong>
+        <a className="brand" href="#top" aria-label="DEVIS SWISS accueil">
+          <img className="brand-logo" src={devisLogo} alt="DEVIS SWISS" />
         </a>
         <nav aria-label="Navigation principale">
           <a href="#services">Services</a>
+          <a href="#subventions">Subventions</a>
           <a href="#fonctionnement">Fonctionnement</a>
           <a href="#devis">Demande</a>
         </nav>
       </header>
 
-      <section className="hero" id="top">
-        <div className="hero-copy">
-          <p className="eyebrow">Comparateur de devis en Suisse</p>
-          <h1>
-            Recevez gratuitement 4 devis
-            <span>et choisissez la meilleure offre</span>
-          </h1>
-          <p>
-            Une seule demande pour comparer des prestataires qualifiés près de
-            chez vous. Simple, clair, gratuit et sans engagement.
-          </p>
-          <div className="hero-actions">
-            <a className="primary-link" href="#devis">
-              Recevoir mes 4 devis
-            </a>
-            <a className="secondary-link" href="#fonctionnement">
-              Comment ça marche
-            </a>
-          </div>
-          <div className="trust-row" aria-label="Avantages principaux">
-            {benefits.map((benefit) => (
-              <span key={benefit}>{benefit}</span>
-            ))}
-          </div>
-        </div>
-
-        <aside className="hero-card" aria-label="Résumé de la demande">
-          <div className="score-card">
-            <span>Note moyenne</span>
-            <strong>4.8/5</strong>
-            <small>Demandes traitées avec suivi clair</small>
-          </div>
-          <img
-            src="https://images.unsplash.com/photo-1503387762-592deb58ef4e?auto=format&fit=crop&w=900&q=80"
-            alt="Plan de construction et outils de chantier"
-          />
-          <div className="mini-stats">
-            <div>
-              <strong>2 min</strong>
-              <span>pour déposer</span>
-            </div>
-            <div>
-              <strong>24-48h</strong>
-              <span>réponse habituelle</span>
-            </div>
-          </div>
-        </aside>
-      </section>
-
       <section className="quote-section" id="devis">
-        <div className="quote-intro">
-          <p className="eyebrow">Demande express</p>
-          <h2>Votre devis commence ici.</h2>
-          <p>
-            Choisissez un service, ajoutez quelques détails et préparez une
-            demande professionnelle.
-          </p>
-          <div className="service-chips" id="services" aria-label="Services populaires">
-            {services.map((service) => (
-              <button
-                className={form.service === service ? 'active' : ''}
-                key={service}
-                type="button"
-                onClick={() => updateForm('service', service)}
-              >
-                {service}
-              </button>
-            ))}
-          </div>
-        </div>
-
         <form className="quote-form" onSubmit={submitQuote}>
           <div className="form-header">
-            <span>DEVIS SUITE</span>
-            <strong>Recevoir gratuitement 4 devis</strong>
+            <p className="eyebrow">Comparateur de devis en Suisse</p>
+            <h1>
+              Recevez gratuitement 4 devis
+              <span>et choisissez la meilleure offre</span>
+            </h1>
+            <p>
+              Choisissez un service et laissez vos coordonnées. Votre demande
+              est préparée en quelques secondes, gratuitement et sans engagement.
+            </p>
           </div>
 
           <label>
@@ -305,16 +382,6 @@ function App() {
             </select>
           </label>
 
-          <label>
-            Votre projet
-            <textarea
-              value={form.project}
-              onChange={(event) => updateForm('project', event.target.value)}
-              placeholder="Exemple: repeindre un appartement de 3 pièces avant remise des clés."
-              rows={4}
-            />
-          </label>
-
           <div className="form-row">
             <label>
               Canton
@@ -327,17 +394,36 @@ function App() {
                 </option>
                 {cantons.map((canton) => (
                   <option key={canton.id} value={String(canton.id)}>
-                    {String(canton.id).padStart(2, '0')} - {canton.name} ({canton.abbreviation})
+                    {formatCanton(canton)}
                   </option>
                 ))}
               </select>
             </label>
             <label>
+              Prénom
+              <input
+                value={form.firstName}
+                onChange={(event) => updateForm('firstName', event.target.value)}
+                placeholder="Prénom"
+              />
+            </label>
+          </div>
+
+          <div className="form-row">
+            <label>
               Nom
               <input
-                value={form.name}
-                onChange={(event) => updateForm('name', event.target.value)}
-                placeholder="Votre nom"
+                value={form.lastName}
+                onChange={(event) => updateForm('lastName', event.target.value)}
+                placeholder="Nom"
+              />
+            </label>
+            <label>
+              Téléphone
+              <input
+                value={form.phone}
+                onChange={(event) => updateForm('phone', event.target.value)}
+                placeholder="+41 79 000 00 00"
               />
             </label>
           </div>
@@ -353,35 +439,64 @@ function App() {
           </label>
 
           <button className="submit-button" type="submit" disabled={!canSubmit}>
-            Comparer 4 devis gratuits
+            {isSubmitting ? 'Envoi...' : 'Comparer 4 devis gratuits'}
           </button>
 
-          <p className="privacy-note">
-            Gratuit, sans engagement. Vos informations servent uniquement à
-            préparer la demande.
-          </p>
-
-          {submitted && (
+          {submitStatus === 'missingConfig' && (
             <p className="success-message" role="status">
-              Merci. Votre demande est prête: vous pourrez comparer 4 devis et
-              choisir la meilleure offre.
+              Configuration manquante. Contactez l’administrateur du site.
+            </p>
+          )}
+
+          {submitStatus === 'error' && (
+            <p className="error-message" role="alert">
+              L’envoi a échoué. Vérifiez l’URL Apps Script et réessayez.
             </p>
           )}
         </form>
       </section>
 
-      <section className="proof-band" aria-label="Garanties">
-        <div>
-          <strong>4 devis</strong>
-          <span>pour comparer les prix</span>
+      <section className="subsidy-section" id="subventions">
+        <div className="section-title">
+          <p className="eyebrow">Subventions en Suisse</p>
+          <h2>Aides possibles pour vos travaux énergétiques.</h2>
+          <p>
+            En Suisse, les aides dépendent du canton, de la commune, du type de
+            bâtiment et des travaux prévus. Les montants ne sont donc pas
+            automatiques, mais plusieurs mesures peuvent réduire le coût final
+            d’un projet bien préparé.
+          </p>
         </div>
-        <div>
-          <strong>0 CHF</strong>
-          <span>demande sans frais</span>
+
+        <div className="subsidy-grid">
+          {subsidyTopics.map((topic) => (
+            <article key={topic.title}>
+              <h3>{topic.title}</h3>
+              <strong>{topic.amount}</strong>
+              <p>{topic.text}</p>
+            </article>
+          ))}
         </div>
-        <div>
-          <strong>1 demande</strong>
-          <span>transmise clairement</span>
+
+        <div className="subsidy-process">
+          <h3>Comment cela se passe généralement ?</h3>
+          <ol>
+            <li>Identifier le canton et le type exact de travaux.</li>
+            <li>Vérifier les conditions avant de signer ou commencer le chantier.</li>
+            <li>Demander les devis et préparer les documents techniques.</li>
+            <li>Déposer la demande de subvention auprès du service compétent.</li>
+            <li>Attendre la décision, puis lancer les travaux si le dossier est accepté.</li>
+          </ol>
+          <p>
+            Les aides peuvent aller de quelques centaines de francs pour un
+            conseil ou un diagnostic à plusieurs milliers de francs pour un
+            chauffage renouvelable ou une rénovation énergétique plus complète.
+            À titre indicatif, certains programmes cantonaux publient des aides
+            CECB Plus autour de 500 à 1’500 CHF et des contributions par surface
+            énergétique de référence qui peuvent varier fortement selon la
+            classe atteinte et le canton. Le montant exact doit toujours être
+            confirmé avant le début des travaux.
+          </p>
         </div>
       </section>
 
